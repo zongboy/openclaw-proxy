@@ -3,12 +3,10 @@
 openclaw-proxy 是一个面向 OpenClaw 模型服务的 HTTP 反向代理，可将客户端请求原样转发到上游，并在请求头中自动注入 API Key，以保证密钥的安全。
 
 仓库地址：
-
 https://github.com/zongboy/openclaw-proxy
 
-问题反馈：
-
-https://github.com/zongboy/openclaw-proxy/issues
+npm地址：
+https://www.npmjs.com/package/openclaw-proxy
 
 适合这些场景：
 
@@ -123,7 +121,7 @@ sudo cat ~/.openclaw-proxy/.env
 sudo vi ~/.openclaw-proxy/.env
 ```
 
-注意：这种方式可以减少普通用户直接读取 `.env` 的风险，但不能阻止 root 访问，也不能替代专门的密钥管理方案。
+> 注意：这种方式可以减少普通用户直接读取 `.env` 的风险，但不能阻止 root 访问，也不能替代专门的密钥管理方案。更稳妥的做法是让 OpenClaw 与 openclaw-proxy 分别使用独立的普通用户运行，并将各自的配置文件权限限制为仅所属用户可读写。
 
 ## 直接使用环境变量
 
@@ -149,6 +147,29 @@ openclaw-proxy serve
 - `restart`：重启后台代理进程
 - `serve`：前台运行，适合本地调试或容器启动
 
+## 重要说明
+1. 无论使用 `.env` 还是系统环境变量，都建议将 openclaw-proxy 与 OpenClaw 以不同的普通用户身份运行，并将配置文件权限限制为仅当前用户可读写。
+2. 不要将代理监听在公网地址，也不要暴露不必要的对外端口。更安全的做法是仅监听 `127.0.0.1` 或内网受控地址；否则，一旦 OpenClaw 或其他本机进程具备网络访问能力，就可能绕过预期调用路径，间接滥用该代理所持有的上游密钥。
+
+## openclaw.json 配置示例
+
+建议在 `openclaw.json` 中为代理单独配置一个自定义 provider，并将 `baseUrl` 指向代理服务的 OpenAI 兼容入口。
+
+示例：
+
+```json
+"models": {
+  "providers": {
+    "proxy": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "apiKey": "dummy",
+      "api": "openai-completions",
+      "models": []
+    }
+  }
+}
+```
+
 ## 请求示例
 
 查询模型列表：
@@ -168,24 +189,4 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 		"messages": [{"role": "user", "content": "hello"}],
 		"stream": true
 	}'
-```
-
-## 构建与发布
-
-本地构建：
-
-```bash
-npm run build
-```
-
-发布到 npm 前建议先执行：
-
-```bash
-npm pack
-```
-
-然后再执行：
-
-```bash
-npm publish
 ```

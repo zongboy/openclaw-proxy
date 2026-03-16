@@ -1,6 +1,6 @@
 {
   "name": "openclaw-proxy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenClaw model service reverse proxy for npm",
   "author": "pengzong771@163.com",
   "type": "module",
