@@ -1,0 +1,43 @@
+{
+  "name": "openclaw-proxy",
+  "version": "0.1.0",
+  "description": "OpenClaw model service reverse proxy for npm",
+  "author": "pengzong771@163.com",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zongboy/openclaw-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zongboy/openclaw-proxy/issues"
+  },
+  "homepage": "https://github.com/zongboy/openclaw-proxy#readme",
+  "bin": {
+    "openclaw-proxy": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "scripts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js serve",
+    "postinstall": "node ./scripts/postinstall.mjs",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "openclaw",
+    "proxy",
+    "http",
+    "reverse-proxy",
+    "stream"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.14",
+    "typescript": "^5.8.2"
+  }
+}
