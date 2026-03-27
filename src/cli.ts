@@ -305,6 +305,7 @@ function proxyRequest(config: Config, request: IncomingMessage, response: Server
     protocol: upstreamUrl.protocol,
     hostname: upstreamUrl.hostname,
     port: upstreamUrl.port || undefined,
+    family: 4,
     method: request.method,
     path: upstreamUrl.pathname + upstreamUrl.search,
     headers
@@ -367,7 +368,10 @@ function proxyWebSocket(
   const upstreamUrl = buildUpstreamUrl(provider, incomingUrl, result.selection, true);
   const headers = buildUpstreamHeaders(request.headers, result.selection, upstreamUrl.host, true);
   const protocols = parseWebSocketProtocols(request.headers["sec-websocket-protocol"]);
-  const upstreamWebSocket = new WebSocket(upstreamUrl, protocols.length > 0 ? protocols : undefined, { headers });
+  const upstreamWebSocket = new WebSocket(upstreamUrl, protocols.length > 0 ? protocols : undefined, {
+    headers,
+    family: 4
+  });
   let settled = false;
 
   socket.on("error", (error) => {
