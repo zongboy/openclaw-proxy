@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
 import {
+  appendFileSync,
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
   unlinkSync,
   writeFileSync
@@ -25,6 +24,7 @@ import { join } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
+import { format } from "node:util";
 import { WebSocket, WebSocketServer, createWebSocketStream } from "ws";
 
 type RawProviderConfig = {
@@ -76,6 +76,7 @@ type ProviderSelectionResult = {
   selection: ProviderSelection | null;
   statusCode: number;
   message: string;
+  attemptedCredentials: RequestCredential[];
 };
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -101,7 +102,7 @@ const WEBSOCKET_HANDSHAKE_HEADERS = [
 const CONFIG_DIR = join(homedir(), ".openclaw-proxy");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const PID_FILE = join(CONFIG_DIR, "openclaw-proxy.pid");
-const LOG_FILE = join(CONFIG_DIR, "openclaw-proxy.log");
+const LOG_FILE_PREFIX = "openclaw-proxy";
 const DEFAULT_CONFIG = `${JSON.stringify(
   {
     listenAddr: "127.0.0.1:8080",
@@ -155,6 +156,7 @@ function main(): void {
 }
 
 function serveCommand(): void {
+  setupServeLogging();
   ensureConfigFile();
   const config = loadConfig();
   const webSocketServer = new WebSocketServer({ noServer: true });
@@ -213,11 +215,9 @@ function startCommand(): void {
   loadConfig();
 
   const cliPath = fileURLToPath(import.meta.url);
-  const stdoutFd = openSync(LOG_FILE, "a", 0o600);
-  const stderrFd = openSync(LOG_FILE, "a", 0o600);
   const child = spawn(process.execPath, [cliPath, "serve"], {
     detached: true,
-    stdio: ["ignore", stdoutFd, stderrFd],
+    stdio: ["ignore", "ignore", "ignore"],
     env: process.env
   });
 
@@ -227,12 +227,10 @@ function startCommand(): void {
   });
 
   child.unref();
-  closeSync(stdoutFd);
-  closeSync(stderrFd);
   writeFileSync(PID_FILE, `${child.pid}\n`, { encoding: "utf8", mode: 0o600 });
   console.log(`openclaw-proxy started, pid=${child.pid}`);
   console.log(`config: ${CONFIG_FILE}`);
-  console.log(`log: ${LOG_FILE}`);
+  console.log(`log: ${getCurrentLogFile()}`);
 }
 
 function stopCommand(): void {
@@ -259,7 +257,7 @@ function statusCommand(): void {
 
   console.log(`openclaw-proxy is running, pid=${pid}`);
   console.log(`config: ${CONFIG_FILE}`);
-  console.log(`log: ${LOG_FILE}`);
+  console.log(`log: ${getCurrentLogFile()}`);
 }
 
 function restartCommand(): void {
@@ -289,6 +287,11 @@ Commands:
 function proxyRequest(config: Config, request: IncomingMessage, response: ServerResponse): void {
   const result = selectProvider(config, request);
   if (!result.selection) {
+    if (result.attemptedCredentials.length > 0) {
+      console.error(
+        `unknown virtual api-key: method=${request.method ?? "GET"} path=${request.url ?? "/"} credentials=${formatCredentialDebugList(result.attemptedCredentials)}`
+      );
+    }
     writeErrorResponse(response, result.statusCode, result.message);
     return;
   }
@@ -322,7 +325,7 @@ function proxyRequest(config: Config, request: IncomingMessage, response: Server
 
   upstreamRequest.on("error", (error) => {
     console.error(
-      `proxy error: provider=${provider.name} source=${matchedCredential.label} method=${request.method ?? "GET"} path=${incomingUrl.pathname} err=${String(error)}`
+      `proxy error: provider=${provider.name} source=${matchedCredential.label} method=${request.method ?? "GET"} path=${incomingUrl.pathname} upstream=${upstreamUrl.toString()} err=${formatNetworkError(error)}`
     );
     if (!response.headersSent) {
       writeErrorResponse(response, 502, "bad gateway");
@@ -350,6 +353,11 @@ function proxyWebSocket(
 ): void {
   const result = selectProvider(config, request);
   if (!result.selection) {
+    if (result.attemptedCredentials.length > 0) {
+      console.error(
+        `unknown virtual api-key websocket: path=${request.url ?? "/"} credentials=${formatCredentialDebugList(result.attemptedCredentials)}`
+      );
+    }
     writeUpgradeError(socket, result.statusCode, result.message);
     return;
   }
@@ -381,7 +389,7 @@ function proxyWebSocket(
 
   upstreamWebSocket.once("error", (error: Error) => {
     console.error(
-      `websocket upstream error: provider=${provider.name} source=${matchedCredential.label} path=${incomingUrl.pathname}${incomingUrl.search} err=${String(error)}`
+      `websocket upstream error: provider=${provider.name} source=${matchedCredential.label} path=${incomingUrl.pathname}${incomingUrl.search} upstream=${upstreamUrl.toString()} err=${formatNetworkError(error)}`
     );
     if (!settled && !socket.destroyed) {
       settled = true;
@@ -568,16 +576,17 @@ function selectProvider(config: Config, request: IncomingMessage): ProviderSelec
             virtualApiKey: credential.value
           },
           statusCode: 200,
-          message: "ok"
+          message: "ok",
+          attemptedCredentials: credentials
         };
       }
     }
   }
 
   if (credentials.length > 0) {
-    return { selection: null, statusCode: 403, message: "unknown virtual api-key" };
+    return { selection: null, statusCode: 403, message: "unknown virtual api-key", attemptedCredentials: credentials };
   }
-  return { selection: null, statusCode: 401, message: "missing virtual api-key" };
+  return { selection: null, statusCode: 401, message: "missing virtual api-key", attemptedCredentials: [] };
 }
 
 function collectRequestCredentials(request: IncomingMessage): RequestCredential[] {
@@ -726,6 +735,115 @@ function replaceAuthorizationCredential(value: string, virtualApiKey: string, re
     return bearerMatch[1].trim() === virtualApiKey ? `Bearer ${realApiKey}` : value;
   }
   return value.trim() === virtualApiKey ? realApiKey : value;
+}
+
+function formatNetworkError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  if (error instanceof AggregateError) {
+    const nestedErrors = error.errors
+      .map((nestedError) => formatSingleError(nestedError))
+      .filter((entry) => entry.length > 0);
+    return nestedErrors.length > 0 ? `AggregateError[${nestedErrors.join("; ")}]` : error.message;
+  }
+
+  return formatSingleError(error);
+}
+
+function formatSingleError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const parts = [error.name];
+  const errorWithCode = error as Error & {
+    code?: string;
+    errno?: number | string;
+    syscall?: string;
+    address?: string;
+    port?: number;
+    hostname?: string;
+    cause?: unknown;
+  };
+
+  if (errorWithCode.code) {
+    parts.push(`code=${errorWithCode.code}`);
+  }
+  if (errorWithCode.errno !== undefined) {
+    parts.push(`errno=${String(errorWithCode.errno)}`);
+  }
+  if (errorWithCode.syscall) {
+    parts.push(`syscall=${errorWithCode.syscall}`);
+  }
+  if (errorWithCode.hostname) {
+    parts.push(`hostname=${errorWithCode.hostname}`);
+  }
+  if (errorWithCode.address) {
+    parts.push(`address=${errorWithCode.address}`);
+  }
+  if (errorWithCode.port !== undefined) {
+    parts.push(`port=${String(errorWithCode.port)}`);
+  }
+  if (error.message) {
+    parts.push(`message=${error.message}`);
+  }
+  if (errorWithCode.cause) {
+    parts.push(`cause=${formatNetworkError(errorWithCode.cause)}`);
+  }
+
+  return parts.join(" ");
+}
+
+function formatCredentialDebugList(credentials: RequestCredential[]): string {
+  return credentials.map((credential) => `${credential.label}=${maskCredentialValue(credential.value)}`).join(", ");
+}
+
+function maskCredentialValue(value: string): string {
+  if (!value) {
+    return "(empty)";
+  }
+  if (value.length <= 6) {
+    return `${value.slice(0, 1)}***${value.slice(-1)}`;
+  }
+  return `${value.slice(0, 4)}***${value.slice(-2)}`;
+}
+
+function setupServeLogging(): void {
+  const stdoutWrite = process.stdout.write.bind(process.stdout);
+  const stderrWrite = process.stderr.write.bind(process.stderr);
+
+  console.log = (...args: unknown[]) => {
+    writeLogLine("INFO", format(...args), stdoutWrite);
+  };
+
+  console.error = (...args: unknown[]) => {
+    writeLogLine("ERROR", format(...args), stderrWrite);
+  };
+}
+
+function writeLogLine(
+  level: "INFO" | "ERROR",
+  message: string,
+  output: (chunk: string) => boolean
+): void {
+  const timestamp = new Date().toISOString();
+  const normalizedMessage = message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalizedMessage.split("\n");
+
+  for (const line of lines) {
+    const entry = `[${timestamp}] [${level}] ${line}`;
+    appendFileSync(getCurrentLogFile(), `${entry}\n`, { encoding: "utf8", mode: 0o600 });
+    output(`${entry}\n`);
+  }
+}
+
+function getCurrentLogFile(now: Date = new Date()): string {
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return join(CONFIG_DIR, `${LOG_FILE_PREFIX}-${year}-${month}-${day}.log`);
 }
 
 function writeErrorResponse(response: ServerResponse, statusCode: number, message: string): void {
