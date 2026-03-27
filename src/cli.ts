@@ -10,8 +10,6 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -22,17 +20,19 @@ import {
 import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
+import { WebSocket, WebSocketServer, createWebSocketStream } from "ws";
 
 type RawProviderConfig = {
   name?: unknown;
   virtualApiKey?: unknown;
+  virtualApiKeys?: unknown;
   targetBaseUrl?: unknown;
   apiKey?: unknown;
-  apiKeyValue?: unknown;
-  apiKeyHeader?: unknown;
-  apiKeyPrefix?: unknown;
 };
 
 type RawConfigFile = {
@@ -40,12 +40,23 @@ type RawConfigFile = {
   providers?: unknown;
 };
 
+type CredentialType = "authorization" | "header" | "query";
+type CredentialScheme = "bearer" | "raw";
+
+type RequestCredential = {
+  value: string;
+  rawValue: string;
+  type: CredentialType;
+  name?: string;
+  scheme: CredentialScheme;
+  label: string;
+};
+
 type ProviderConfig = {
   name: string;
-  virtualApiKey: string;
+  virtualApiKeys: string[];
   targetBaseURL: URL;
-  injectHeader: string;
-  injectValue: string;
+  apiKey: string;
 };
 
 type Config = {
@@ -53,7 +64,18 @@ type Config = {
   listenHost?: string;
   listenPort: number;
   providers: ProviderConfig[];
-  providersByVirtualKey: Map<string, ProviderConfig>;
+};
+
+type ProviderSelection = {
+  provider: ProviderConfig;
+  matchedCredential: RequestCredential;
+  virtualApiKey: string;
+};
+
+type ProviderSelectionResult = {
+  selection: ProviderSelection | null;
+  statusCode: number;
+  message: string;
 };
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -67,6 +89,15 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade"
 ]);
 
+const WEBSOCKET_HANDSHAKE_HEADERS = [
+  "host",
+  "sec-websocket-accept",
+  "sec-websocket-extensions",
+  "sec-websocket-key",
+  "sec-websocket-protocol",
+  "sec-websocket-version"
+];
+
 const CONFIG_DIR = join(homedir(), ".openclaw-proxy");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const PID_FILE = join(CONFIG_DIR, "openclaw-proxy.pid");
@@ -78,11 +109,8 @@ const DEFAULT_CONFIG = `${JSON.stringify(
       {
         name: "aliyuncs",
         virtualApiKey: "proxy-aliyuncs-demo",
-        targetBaseUrl: "https://your-openclaw.example.com/v1",
-        apiKey: "your-real-api-key",
-        apiKeyValue: "",
-        apiKeyHeader: "Authorization",
-        apiKeyPrefix: "Bearer"
+        targetBaseUrl: "https://your-openclaw.example.com",
+        apiKey: "your-real-api-key"
       }
     ]
   },
@@ -129,6 +157,11 @@ function main(): void {
 function serveCommand(): void {
   ensureConfigFile();
   const config = loadConfig();
+  const webSocketServer = new WebSocketServer({ noServer: true });
+
+  webSocketServer.on("headers", (headers: string[]) => {
+    headers.push("x-proxy-by: openclaw-proxy");
+  });
 
   const server = createServer((request, response) => {
     const requestUrl = new URL(request.url ?? "/", "http://proxy.local");
@@ -139,6 +172,10 @@ function serveCommand(): void {
     }
 
     proxyRequest(config, request, response);
+  });
+
+  server.on("upgrade", (request, socket, head) => {
+    proxyWebSocket(config, webSocketServer, request, socket, head);
   });
 
   server.on("listening", () => {
@@ -250,21 +287,16 @@ Commands:
 }
 
 function proxyRequest(config: Config, request: IncomingMessage, response: ServerResponse): void {
-  const provider = selectProvider(config, request, response);
-  if (!provider) {
+  const result = selectProvider(config, request);
+  if (!result.selection) {
+    writeErrorResponse(response, result.statusCode, result.message);
     return;
   }
 
+  const { provider, matchedCredential } = result.selection;
   const incomingUrl = new URL(request.url ?? "/", "http://proxy.local");
-  const upstreamUrl = new URL(provider.targetBaseURL.toString());
-
-  upstreamUrl.pathname = joinPath(provider.targetBaseURL.pathname, incomingUrl.pathname);
-  upstreamUrl.search = joinSearch(provider.targetBaseURL.search, incomingUrl.search);
-
-  const headers = cloneHeaders(request.headers);
-  delete headers.authorization;
-  headers.host = upstreamUrl.host;
-  headers[provider.injectHeader.toLowerCase()] = provider.injectValue;
+  const upstreamUrl = buildUpstreamUrl(provider, incomingUrl, result.selection, false);
+  const headers = buildUpstreamHeaders(request.headers, result.selection, upstreamUrl.host, false);
 
   const options: RequestOptions = {
     protocol: upstreamUrl.protocol,
@@ -289,21 +321,137 @@ function proxyRequest(config: Config, request: IncomingMessage, response: Server
   });
 
   upstreamRequest.on("error", (error) => {
-    console.error(`proxy error: method=${request.method ?? "GET"} path=${incomingUrl.pathname} err=${String(error)}`);
+    console.error(
+      `proxy error: provider=${provider.name} source=${matchedCredential.label} method=${request.method ?? "GET"} path=${incomingUrl.pathname} err=${String(error)}`
+    );
     if (!response.headersSent) {
-      response.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+      writeErrorResponse(response, 502, "bad gateway");
+      return;
     }
-    response.end("bad gateway");
+    response.end();
   });
 
   request.on("aborted", () => upstreamRequest.destroy());
   response.on("finish", () => {
     console.log(
-      `request provider=${provider.name} method=${request.method ?? "GET"} path=${incomingUrl.pathname}${incomingUrl.search} remote=${request.socket.remoteAddress ?? "unknown"}`
+      `request provider=${provider.name} source=${matchedCredential.label} method=${request.method ?? "GET"} path=${incomingUrl.pathname}${incomingUrl.search} remote=${request.socket.remoteAddress ?? "unknown"}`
     );
   });
 
   request.pipe(upstreamRequest);
+}
+
+function proxyWebSocket(
+  config: Config,
+  webSocketServer: WebSocketServer,
+  request: IncomingMessage,
+  socket: Duplex,
+  head: Buffer
+): void {
+  const result = selectProvider(config, request);
+  if (!result.selection) {
+    writeUpgradeError(socket, result.statusCode, result.message);
+    return;
+  }
+
+  const { provider, matchedCredential } = result.selection;
+  const incomingUrl = new URL(request.url ?? "/", "http://proxy.local");
+  const upstreamUrl = buildUpstreamUrl(provider, incomingUrl, result.selection, true);
+  const headers = buildUpstreamHeaders(request.headers, result.selection, upstreamUrl.host, true);
+  const protocols = parseWebSocketProtocols(request.headers["sec-websocket-protocol"]);
+  const upstreamWebSocket = new WebSocket(upstreamUrl, protocols.length > 0 ? protocols : undefined, { headers });
+  let settled = false;
+
+  socket.on("error", (error) => {
+    console.error(`websocket client socket error: ${String(error)}`);
+    upstreamWebSocket.terminate();
+  });
+
+  upstreamWebSocket.once("unexpected-response", (_upstreamRequest: IncomingMessage, upstreamResponse: IncomingMessage) => {
+    if (!settled && !socket.destroyed) {
+      settled = true;
+      writeUpgradeError(
+        socket,
+        upstreamResponse.statusCode ?? 502,
+        `upstream websocket rejected: ${upstreamResponse.statusMessage || "bad gateway"}`
+      );
+    }
+    upstreamWebSocket.terminate();
+  });
+
+  upstreamWebSocket.once("error", (error: Error) => {
+    console.error(
+      `websocket upstream error: provider=${provider.name} source=${matchedCredential.label} path=${incomingUrl.pathname}${incomingUrl.search} err=${String(error)}`
+    );
+    if (!settled && !socket.destroyed) {
+      settled = true;
+      writeUpgradeError(socket, 502, "bad gateway");
+    }
+  });
+
+  upstreamWebSocket.once("open", () => {
+    if (socket.destroyed) {
+      upstreamWebSocket.close();
+      return;
+    }
+    settled = true;
+    webSocketServer.handleUpgrade(request, socket, head, (clientWebSocket: WebSocket) => {
+      bridgeWebSockets(
+        clientWebSocket,
+        upstreamWebSocket,
+        provider.name,
+        matchedCredential.label,
+        incomingUrl.pathname + incomingUrl.search
+      );
+    });
+  });
+}
+
+function bridgeWebSockets(
+  clientWebSocket: WebSocket,
+  upstreamWebSocket: WebSocket,
+  providerName: string,
+  sourceLabel: string,
+  path: string
+): void {
+  const clientStream = createWebSocketStream(clientWebSocket);
+  const upstreamStream = createWebSocketStream(upstreamWebSocket);
+
+  clientStream.pipe(upstreamStream);
+  upstreamStream.pipe(clientStream);
+
+  clientWebSocket.on("error", (error: Error) => {
+    console.error(`websocket client error: provider=${providerName} source=${sourceLabel} path=${path} err=${String(error)}`);
+    upstreamWebSocket.terminate();
+  });
+
+  upstreamWebSocket.on("error", (error: Error) => {
+    console.error(`websocket upstream error: provider=${providerName} source=${sourceLabel} path=${path} err=${String(error)}`);
+    clientWebSocket.terminate();
+  });
+
+  clientStream.on("error", (error: Error) => {
+    console.error(`websocket client stream error: provider=${providerName} source=${sourceLabel} path=${path} err=${String(error)}`);
+    upstreamWebSocket.terminate();
+  });
+
+  upstreamStream.on("error", (error: Error) => {
+    console.error(`websocket upstream stream error: provider=${providerName} source=${sourceLabel} path=${path} err=${String(error)}`);
+    clientWebSocket.terminate();
+  });
+
+  clientWebSocket.on("close", () => {
+    if (upstreamWebSocket.readyState === WebSocket.OPEN || upstreamWebSocket.readyState === WebSocket.CONNECTING) {
+      upstreamWebSocket.close();
+    }
+  });
+
+  upstreamWebSocket.on("close", () => {
+    if (clientWebSocket.readyState === WebSocket.OPEN || clientWebSocket.readyState === WebSocket.CONNECTING) {
+      clientWebSocket.close();
+    }
+    console.log(`websocket provider=${providerName} source=${sourceLabel} path=${path}`);
+  });
 }
 
 function loadConfig(): Config {
@@ -311,21 +459,23 @@ function loadConfig(): Config {
   const listen = parseListenAddr(readOptionalString(configRaw.listenAddr, "listenAddr") || "127.0.0.1:8080");
   const rawProviders = readProviders(configRaw.providers);
   const providers = rawProviders.map((provider, index) => normalizeProvider(provider, index));
-  const providersByVirtualKey = new Map<string, ProviderConfig>();
+  const virtualKeys = new Map<string, string>();
 
   for (const provider of providers) {
-    if (providersByVirtualKey.has(provider.virtualApiKey)) {
-      throw new Error(`duplicate virtualApiKey: ${provider.virtualApiKey}`);
+    for (const virtualApiKey of provider.virtualApiKeys) {
+      const previousProvider = virtualKeys.get(virtualApiKey);
+      if (previousProvider) {
+        throw new Error(`duplicate virtualApiKey: ${virtualApiKey} (${previousProvider}, ${provider.name})`);
+      }
+      virtualKeys.set(virtualApiKey, provider.name);
     }
-    providersByVirtualKey.set(provider.virtualApiKey, provider);
   }
 
   return {
     listenAddr: listen.display,
     listenHost: listen.host,
     listenPort: listen.port,
-    providers,
-    providersByVirtualKey
+    providers
   };
 }
 
@@ -381,81 +531,277 @@ function normalizeProvider(rawProvider: RawProviderConfig, index: number): Provi
   }
 
   const name = readRequiredString(rawProvider.name, `providers[${index}].name`);
-  const virtualApiKey = readRequiredString(rawProvider.virtualApiKey, `providers[${index}].virtualApiKey`);
+  const legacyVirtualApiKey = readOptionalString(rawProvider.virtualApiKey, `providers[${index}].virtualApiKey`);
+  const virtualApiKeys = new Set(readStringArray(rawProvider.virtualApiKeys, `providers[${index}].virtualApiKeys`));
+  if (legacyVirtualApiKey) {
+    virtualApiKeys.add(legacyVirtualApiKey);
+  }
+  if (virtualApiKeys.size === 0) {
+    throw new Error(`providers[${index}].virtualApiKey or providers[${index}].virtualApiKeys is required`);
+  }
+
   const targetRaw = readRequiredString(rawProvider.targetBaseUrl, `providers[${index}].targetBaseUrl`);
   const targetBaseURL = new URL(targetRaw);
   if (!targetBaseURL.protocol || !targetBaseURL.host) {
     throw new Error(`providers[${index}].targetBaseUrl must include scheme and host`);
   }
 
-  const injectHeader = readOptionalString(rawProvider.apiKeyHeader, `providers[${index}].apiKeyHeader`) || "Authorization";
-  const injectValue = buildInjectValue(rawProvider, injectHeader, index);
-  if (!injectValue) {
-    throw new Error(`providers[${index}] apiKey or apiKeyValue is required`);
-  }
+  const apiKey = readRequiredString(rawProvider.apiKey, `providers[${index}].apiKey`);
 
   return {
     name,
-    virtualApiKey,
+    virtualApiKeys: [...virtualApiKeys],
     targetBaseURL,
-    injectHeader,
-    injectValue
+    apiKey
   };
 }
 
-function buildInjectValue(rawProvider: RawProviderConfig, headerName: string, index: number): string {
-  const explicitValue = readOptionalString(rawProvider.apiKeyValue, `providers[${index}].apiKeyValue`) || "";
-  if (explicitValue) {
-    return explicitValue;
+function selectProvider(config: Config, request: IncomingMessage): ProviderSelectionResult {
+  const credentials = collectRequestCredentials(request);
+  for (const credential of credentials) {
+    for (const provider of config.providers) {
+      if (provider.virtualApiKeys.includes(credential.value)) {
+        return {
+          selection: {
+            provider,
+            matchedCredential: credential,
+            virtualApiKey: credential.value
+          },
+          statusCode: 200,
+          message: "ok"
+        };
+      }
+    }
   }
 
-  const apiKey = readOptionalString(rawProvider.apiKey, `providers[${index}].apiKey`) || "";
-  if (!apiKey) {
-    return "";
+  if (credentials.length > 0) {
+    return { selection: null, statusCode: 403, message: "unknown virtual api-key" };
   }
-
-  let prefix = readOptionalString(rawProvider.apiKeyPrefix, `providers[${index}].apiKeyPrefix`) || "";
-  if (!prefix && headerName.toLowerCase() === "authorization") {
-    prefix = "Bearer";
-  }
-
-  return prefix ? `${prefix} ${apiKey}` : apiKey;
+  return { selection: null, statusCode: 401, message: "missing virtual api-key" };
 }
 
-function selectProvider(config: Config, request: IncomingMessage, response: ServerResponse): ProviderConfig | null {
-  const virtualApiKey = readVirtualApiKey(request.headers.authorization);
-  if (!virtualApiKey) {
-    writeErrorResponse(response, 401, "missing authorization virtual api-key");
-    return null;
+function collectRequestCredentials(request: IncomingMessage): RequestCredential[] {
+  const credentials: RequestCredential[] = [];
+  const authorization = readFirstHeaderValue(request.headers.authorization);
+  if (authorization) {
+    const bearerValue = normalizeCredentialValue(authorization, "bearer");
+    if (bearerValue) {
+      credentials.push({
+        value: bearerValue,
+        rawValue: authorization,
+        type: "authorization",
+        scheme: "bearer",
+        label: "authorization:bearer"
+      });
+    } else {
+      const rawValue = normalizeCredentialValue(authorization, "raw");
+      if (rawValue) {
+        credentials.push({
+          value: rawValue,
+          rawValue: authorization,
+          type: "authorization",
+          scheme: "raw",
+          label: "authorization:raw"
+        });
+      }
+    }
   }
 
-  const provider = config.providersByVirtualKey.get(virtualApiKey);
-  if (!provider) {
-    writeErrorResponse(response, 403, "unknown authorization virtual api-key");
-    return null;
+  for (const headerName of ["x-api-key", "api-key"]) {
+    const headerValue = readFirstHeaderValue(request.headers[headerName]);
+    if (!headerValue) {
+      continue;
+    }
+    credentials.push({
+      value: normalizeCredentialValue(headerValue, "raw"),
+      rawValue: headerValue,
+      type: "header",
+      name: headerName,
+      scheme: "raw",
+      label: `header:${headerName}:raw`
+    });
   }
 
-  return provider;
+  const requestUrl = new URL(request.url ?? "/", "http://proxy.local");
+  const queryValue = requestUrl.searchParams.get("api_key") || "";
+  if (queryValue) {
+    credentials.push({
+      value: normalizeCredentialValue(queryValue, "raw"),
+      rawValue: queryValue,
+      type: "query",
+      name: "api_key",
+      scheme: "raw",
+      label: "query:api_key:raw"
+    });
+  }
+
+  return credentials.filter((credential) => credential.value);
 }
 
-function readVirtualApiKey(headerValue: string | string[] | undefined): string {
-  const rawValue = Array.isArray(headerValue) ? headerValue.find((value) => value.trim()) : headerValue;
-  if (!rawValue) {
-    return "";
-  }
-
+function normalizeCredentialValue(rawValue: string, scheme: CredentialScheme): string {
   const trimmed = rawValue.trim();
-  const bearerMatch = /^Bearer\s+(.+)$/i.exec(trimmed);
-  if (bearerMatch) {
-    return bearerMatch[1].trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (scheme === "raw") {
+    return trimmed;
   }
 
-  return trimmed;
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(trimmed);
+  return bearerMatch ? bearerMatch[1].trim() : "";
+}
+
+function buildUpstreamUrl(provider: ProviderConfig, incomingUrl: URL, selection: ProviderSelection, isWebSocket: boolean): URL {
+  const upstreamUrl = new URL(provider.targetBaseURL.toString());
+  upstreamUrl.pathname = joinPath(provider.targetBaseURL.pathname, incomingUrl.pathname);
+  upstreamUrl.search = joinSearch(provider.targetBaseURL.search, incomingUrl.search);
+
+  if (selection.matchedCredential.type === "query" && selection.matchedCredential.name) {
+    upstreamUrl.searchParams.set(selection.matchedCredential.name, provider.apiKey);
+  }
+
+  if (isWebSocket) {
+    if (upstreamUrl.protocol === "http:") {
+      upstreamUrl.protocol = "ws:";
+    } else if (upstreamUrl.protocol === "https:") {
+      upstreamUrl.protocol = "wss:";
+    }
+  }
+
+  return upstreamUrl;
+}
+
+function buildUpstreamHeaders(
+  headers: IncomingHttpHeaders,
+  selection: ProviderSelection,
+  upstreamHost: string,
+  isWebSocket: boolean
+): Record<string, string | string[]> {
+  const cloned = cloneHeaders(headers);
+
+  if (isWebSocket) {
+    for (const headerName of WEBSOCKET_HANDSHAKE_HEADERS) {
+      delete cloned[headerName];
+    }
+  }
+
+  cloned.host = upstreamHost;
+  replaceKnownCredentialHeaders(cloned, selection.virtualApiKey, selection.provider.apiKey);
+
+  return cloned;
+}
+
+function replaceKnownCredentialHeaders(
+  headers: Record<string, string | string[]>,
+  virtualApiKey: string,
+  realApiKey: string
+): void {
+  const authorization = headers.authorization;
+  if (authorization !== undefined) {
+    headers.authorization = replaceHeaderValue(authorization, (value) => replaceAuthorizationCredential(value, virtualApiKey, realApiKey));
+  }
+
+  for (const headerName of ["x-api-key", "api-key"]) {
+    const headerValue = headers[headerName];
+    if (headerValue === undefined) {
+      continue;
+    }
+    headers[headerName] = replaceHeaderValue(headerValue, (value) => (value.trim() === virtualApiKey ? realApiKey : value));
+  }
+}
+
+function replaceHeaderValue(
+  headerValue: string | string[],
+  replacer: (value: string) => string
+): string | string[] {
+  if (Array.isArray(headerValue)) {
+    return headerValue.map(replacer);
+  }
+  return replacer(headerValue);
+}
+
+function replaceAuthorizationCredential(value: string, virtualApiKey: string, realApiKey: string): string {
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(value.trim());
+  if (bearerMatch) {
+    return bearerMatch[1].trim() === virtualApiKey ? `Bearer ${realApiKey}` : value;
+  }
+  return value.trim() === virtualApiKey ? realApiKey : value;
 }
 
 function writeErrorResponse(response: ServerResponse, statusCode: number, message: string): void {
-  response.writeHead(statusCode, { "content-type": "text/plain; charset=utf-8" });
-  response.end(message);
+  const payload = JSON.stringify({
+    error: {
+      message,
+      type: errorTypeForStatus(statusCode),
+      status: statusCode
+    }
+  });
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(payload).toString(),
+    "x-proxy-by": "openclaw-proxy"
+  });
+  response.end(payload);
+}
+
+function writeUpgradeError(socket: Duplex, statusCode: number, message: string): void {
+  const payload = JSON.stringify({
+    error: {
+      message,
+      type: errorTypeForStatus(statusCode),
+      status: statusCode
+    }
+  });
+  const response = [
+    `HTTP/1.1 ${statusCode} ${httpStatusText(statusCode)}`,
+    "Connection: close",
+    "Content-Type: application/json; charset=utf-8",
+    `Content-Length: ${Buffer.byteLength(payload)}`,
+    "x-proxy-by: openclaw-proxy",
+    "",
+    payload
+  ].join("\r\n");
+
+  socket.write(response);
+  socket.destroy();
+}
+
+function errorTypeForStatus(statusCode: number): string {
+  if (statusCode === 400) {
+    return "invalid_request_error";
+  }
+  if (statusCode === 401 || statusCode === 403) {
+    return "authentication_error";
+  }
+  return "proxy_error";
+}
+
+function httpStatusText(statusCode: number): string {
+  switch (statusCode) {
+    case 400:
+      return "Bad Request";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
+    case 404:
+      return "Not Found";
+    case 502:
+      return "Bad Gateway";
+    default:
+      return "Error";
+  }
+}
+
+function parseWebSocketProtocols(headerValue: string | string[] | undefined): string[] {
+  const rawValue = readFirstHeaderValue(headerValue);
+  if (!rawValue) {
+    return [];
+  }
+  return rawValue
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
 }
 
 function cloneHeaders(headers: IncomingHttpHeaders): Record<string, string | string[]> {
@@ -480,6 +826,13 @@ function filterResponseHeaders(headers: IncomingHttpHeaders): Record<string, str
   return filtered;
 }
 
+function readFirstHeaderValue(headerValue: string | string[] | undefined): string {
+  if (Array.isArray(headerValue)) {
+    return headerValue.find((value) => value.trim()) || "";
+  }
+  return headerValue || "";
+}
+
 function readRequiredString(value: unknown, fieldName: string): string {
   const normalized = readOptionalString(value, fieldName);
   if (!normalized) {
@@ -492,13 +845,23 @@ function readOptionalString(value: unknown, fieldName: string): string | undefin
   if (value === undefined || value === null) {
     return undefined;
   }
-
   if (typeof value !== "string") {
     throw new Error(`${fieldName} must be a string`);
   }
 
   const normalized = value.trim();
   return normalized ? normalized : undefined;
+}
+
+function readStringArray(value: unknown, fieldName: string): string[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array of strings`);
+  }
+
+  return value.map((entry, index) => readRequiredString(entry, `${fieldName}[${index}]`));
 }
 
 function ensureConfigDir(): void {
