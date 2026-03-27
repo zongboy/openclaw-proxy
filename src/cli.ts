@@ -25,13 +25,35 @@ import { request as httpsRequest } from "node:https";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 
+type RawProviderConfig = {
+  name?: unknown;
+  virtualApiKey?: unknown;
+  targetBaseUrl?: unknown;
+  apiKey?: unknown;
+  apiKeyValue?: unknown;
+  apiKeyHeader?: unknown;
+  apiKeyPrefix?: unknown;
+};
+
+type RawConfigFile = {
+  listenAddr?: unknown;
+  providers?: unknown;
+};
+
+type ProviderConfig = {
+  name: string;
+  virtualApiKey: string;
+  targetBaseURL: URL;
+  injectHeader: string;
+  injectValue: string;
+};
+
 type Config = {
   listenAddr: string;
   listenHost?: string;
   listenPort: number;
-  targetBaseURL: URL;
-  injectHeader: string;
-  injectValue: string;
+  providers: ProviderConfig[];
+  providersByVirtualKey: Map<string, ProviderConfig>;
 };
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -46,15 +68,27 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 const CONFIG_DIR = join(homedir(), ".openclaw-proxy");
-const ENV_FILE = join(CONFIG_DIR, ".env");
+const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const PID_FILE = join(CONFIG_DIR, "openclaw-proxy.pid");
 const LOG_FILE = join(CONFIG_DIR, "openclaw-proxy.log");
-const DEFAULT_ENV = `TARGET_BASE_URL="https://your-openclaw.example.com"
-API_KEY="your-openclaw-key"
-API_KEY_VALUE=""
-API_KEY_HEADER="Authorization"
-API_KEY_PREFIX="Bearer"
-LISTEN_ADDR=":8080"
+const DEFAULT_CONFIG = `${JSON.stringify(
+  {
+    listenAddr: "127.0.0.1:8080",
+    providers: [
+      {
+        name: "aliyuncs",
+        virtualApiKey: "proxy-aliyuncs-demo",
+        targetBaseUrl: "https://your-openclaw.example.com/v1",
+        apiKey: "your-real-api-key",
+        apiKeyValue: "",
+        apiKeyHeader: "Authorization",
+        apiKeyPrefix: "Bearer"
+      }
+    ]
+  },
+  null,
+  2
+)}
 `;
 
 function main(): void {
@@ -93,8 +127,7 @@ function main(): void {
 }
 
 function serveCommand(): void {
-  ensureEnvFile();
-  loadDotEnvIfPresent(ENV_FILE);
+  ensureConfigFile();
   const config = loadConfig();
 
   const server = createServer((request, response) => {
@@ -110,7 +143,7 @@ function serveCommand(): void {
 
   server.on("listening", () => {
     console.log(
-      `openclaw-proxy listening on ${config.listenAddr}, upstream=${config.targetBaseURL.toString()}, inject_header=${config.injectHeader}`
+      `openclaw-proxy listening on ${config.listenAddr}, config=${CONFIG_FILE}, providers=${config.providers.length}`
     );
   });
 
@@ -134,13 +167,12 @@ function serveCommand(): void {
 }
 
 function startCommand(): void {
-  ensureEnvFile();
+  ensureConfigFile();
   if (isRunning()) {
     console.log(`openclaw-proxy is already running, pid=${readPid()}`);
     return;
   }
 
-  loadDotEnvIfPresent(ENV_FILE);
   loadConfig();
 
   const cliPath = fileURLToPath(import.meta.url);
@@ -162,7 +194,7 @@ function startCommand(): void {
   closeSync(stderrFd);
   writeFileSync(PID_FILE, `${child.pid}\n`, { encoding: "utf8", mode: 0o600 });
   console.log(`openclaw-proxy started, pid=${child.pid}`);
-  console.log(`config: ${ENV_FILE}`);
+  console.log(`config: ${CONFIG_FILE}`);
   console.log(`log: ${LOG_FILE}`);
 }
 
@@ -184,12 +216,12 @@ function statusCommand(): void {
   if (!pid || !isProcessRunning(pid)) {
     removePidFileIfOwned();
     console.log("openclaw-proxy is not running");
-    console.log(`config: ${ENV_FILE}`);
+    console.log(`config: ${CONFIG_FILE}`);
     return;
   }
 
   console.log(`openclaw-proxy is running, pid=${pid}`);
-  console.log(`config: ${ENV_FILE}`);
+  console.log(`config: ${CONFIG_FILE}`);
   console.log(`log: ${LOG_FILE}`);
 }
 
@@ -199,8 +231,8 @@ function restartCommand(): void {
 }
 
 function initCommand(): void {
-  ensureEnvFile();
-  console.log(`config initialized: ${ENV_FILE}`);
+  ensureConfigFile();
+  console.log(`config initialized: ${CONFIG_FILE}`);
 }
 
 function printUsage(): void {
@@ -218,15 +250,21 @@ Commands:
 }
 
 function proxyRequest(config: Config, request: IncomingMessage, response: ServerResponse): void {
-  const incomingUrl = new URL(request.url ?? "/", "http://proxy.local");
-  const upstreamUrl = new URL(config.targetBaseURL.toString());
+  const provider = selectProvider(config, request, response);
+  if (!provider) {
+    return;
+  }
 
-  upstreamUrl.pathname = joinPath(config.targetBaseURL.pathname, incomingUrl.pathname);
-  upstreamUrl.search = joinSearch(config.targetBaseURL.search, incomingUrl.search);
+  const incomingUrl = new URL(request.url ?? "/", "http://proxy.local");
+  const upstreamUrl = new URL(provider.targetBaseURL.toString());
+
+  upstreamUrl.pathname = joinPath(provider.targetBaseURL.pathname, incomingUrl.pathname);
+  upstreamUrl.search = joinSearch(provider.targetBaseURL.search, incomingUrl.search);
 
   const headers = cloneHeaders(request.headers);
+  delete headers.authorization;
   headers.host = upstreamUrl.host;
-  headers[config.injectHeader.toLowerCase()] = config.injectValue;
+  headers[provider.injectHeader.toLowerCase()] = provider.injectValue;
 
   const options: RequestOptions = {
     protocol: upstreamUrl.protocol,
@@ -261,7 +299,7 @@ function proxyRequest(config: Config, request: IncomingMessage, response: Server
   request.on("aborted", () => upstreamRequest.destroy());
   response.on("finish", () => {
     console.log(
-      `request method=${request.method ?? "GET"} path=${incomingUrl.pathname}${incomingUrl.search} remote=${request.socket.remoteAddress ?? "unknown"}`
+      `request provider=${provider.name} method=${request.method ?? "GET"} path=${incomingUrl.pathname}${incomingUrl.search} remote=${request.socket.remoteAddress ?? "unknown"}`
     );
   });
 
@@ -269,28 +307,51 @@ function proxyRequest(config: Config, request: IncomingMessage, response: Server
 }
 
 function loadConfig(): Config {
-  const targetRaw = getEnvOrThrow("TARGET_BASE_URL");
-  const targetBaseURL = new URL(targetRaw);
-  if (!targetBaseURL.protocol || !targetBaseURL.host) {
-    throw new Error("TARGET_BASE_URL must include scheme and host");
-  }
+  const configRaw = readConfigFile(CONFIG_FILE);
+  const listen = parseListenAddr(readOptionalString(configRaw.listenAddr, "listenAddr") || "127.0.0.1:8080");
+  const rawProviders = readProviders(configRaw.providers);
+  const providers = rawProviders.map((provider, index) => normalizeProvider(provider, index));
+  const providersByVirtualKey = new Map<string, ProviderConfig>();
 
-  const injectHeader = getEnv("API_KEY_HEADER", "Authorization");
-  const injectValue = buildInjectValue(injectHeader);
-  if (!injectValue) {
-    throw new Error("API_KEY or API_KEY_VALUE is required");
+  for (const provider of providers) {
+    if (providersByVirtualKey.has(provider.virtualApiKey)) {
+      throw new Error(`duplicate virtualApiKey: ${provider.virtualApiKey}`);
+    }
+    providersByVirtualKey.set(provider.virtualApiKey, provider);
   }
-
-  const listen = parseListenAddr(getEnv("LISTEN_ADDR", ":8080"));
 
   return {
     listenAddr: listen.display,
     listenHost: listen.host,
     listenPort: listen.port,
-    targetBaseURL,
-    injectHeader,
-    injectValue
+    providers,
+    providersByVirtualKey
   };
+}
+
+function readConfigFile(path: string): RawConfigFile {
+  const content = readFileSync(path, "utf8");
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new Error(`invalid config.json: ${String(error)}`);
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("config.json must contain a JSON object");
+  }
+
+  return parsed as RawConfigFile;
+}
+
+function readProviders(value: unknown): RawProviderConfig[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("config.json providers must be a non-empty array");
+  }
+
+  return value as RawProviderConfig[];
 }
 
 function parseListenAddr(raw: string): { display: string; host?: string; port: number } {
@@ -311,26 +372,90 @@ function parseListenAddr(raw: string): { display: string; host?: string; port: n
     }
   }
 
-  throw new Error("LISTEN_ADDR must be 8080, :8080, or 127.0.0.1:8080");
+  throw new Error("listenAddr must be 8080, :8080, or 127.0.0.1:8080");
 }
 
-function buildInjectValue(headerName: string): string {
-  const explicitValue = getEnv("API_KEY_VALUE", "");
+function normalizeProvider(rawProvider: RawProviderConfig, index: number): ProviderConfig {
+  if (!rawProvider || typeof rawProvider !== "object" || Array.isArray(rawProvider)) {
+    throw new Error(`providers[${index}] must be an object`);
+  }
+
+  const name = readRequiredString(rawProvider.name, `providers[${index}].name`);
+  const virtualApiKey = readRequiredString(rawProvider.virtualApiKey, `providers[${index}].virtualApiKey`);
+  const targetRaw = readRequiredString(rawProvider.targetBaseUrl, `providers[${index}].targetBaseUrl`);
+  const targetBaseURL = new URL(targetRaw);
+  if (!targetBaseURL.protocol || !targetBaseURL.host) {
+    throw new Error(`providers[${index}].targetBaseUrl must include scheme and host`);
+  }
+
+  const injectHeader = readOptionalString(rawProvider.apiKeyHeader, `providers[${index}].apiKeyHeader`) || "Authorization";
+  const injectValue = buildInjectValue(rawProvider, injectHeader, index);
+  if (!injectValue) {
+    throw new Error(`providers[${index}] apiKey or apiKeyValue is required`);
+  }
+
+  return {
+    name,
+    virtualApiKey,
+    targetBaseURL,
+    injectHeader,
+    injectValue
+  };
+}
+
+function buildInjectValue(rawProvider: RawProviderConfig, headerName: string, index: number): string {
+  const explicitValue = readOptionalString(rawProvider.apiKeyValue, `providers[${index}].apiKeyValue`) || "";
   if (explicitValue) {
     return explicitValue;
   }
 
-  const apiKey = getEnv("API_KEY", "");
+  const apiKey = readOptionalString(rawProvider.apiKey, `providers[${index}].apiKey`) || "";
   if (!apiKey) {
     return "";
   }
 
-  let prefix = getEnv("API_KEY_PREFIX", "");
+  let prefix = readOptionalString(rawProvider.apiKeyPrefix, `providers[${index}].apiKeyPrefix`) || "";
   if (!prefix && headerName.toLowerCase() === "authorization") {
     prefix = "Bearer";
   }
 
   return prefix ? `${prefix} ${apiKey}` : apiKey;
+}
+
+function selectProvider(config: Config, request: IncomingMessage, response: ServerResponse): ProviderConfig | null {
+  const virtualApiKey = readVirtualApiKey(request.headers.authorization);
+  if (!virtualApiKey) {
+    writeErrorResponse(response, 401, "missing authorization virtual api-key");
+    return null;
+  }
+
+  const provider = config.providersByVirtualKey.get(virtualApiKey);
+  if (!provider) {
+    writeErrorResponse(response, 403, "unknown authorization virtual api-key");
+    return null;
+  }
+
+  return provider;
+}
+
+function readVirtualApiKey(headerValue: string | string[] | undefined): string {
+  const rawValue = Array.isArray(headerValue) ? headerValue.find((value) => value.trim()) : headerValue;
+  if (!rawValue) {
+    return "";
+  }
+
+  const trimmed = rawValue.trim();
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(trimmed);
+  if (bearerMatch) {
+    return bearerMatch[1].trim();
+  }
+
+  return trimmed;
+}
+
+function writeErrorResponse(response: ServerResponse, statusCode: number, message: string): void {
+  response.writeHead(statusCode, { "content-type": "text/plain; charset=utf-8" });
+  response.end(message);
 }
 
 function cloneHeaders(headers: IncomingHttpHeaders): Record<string, string | string[]> {
@@ -355,58 +480,38 @@ function filterResponseHeaders(headers: IncomingHttpHeaders): Record<string, str
   return filtered;
 }
 
-function getEnv(name: string, fallback: string): string {
-  const value = process.env[name]?.trim();
-  return value ? value : fallback;
+function readRequiredString(value: unknown, fieldName: string): string {
+  const normalized = readOptionalString(value, fieldName);
+  if (!normalized) {
+    throw new Error(`${fieldName} is required`);
+  }
+  return normalized;
 }
 
-function getEnvOrThrow(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) {
-    throw new Error(`${name} is required`);
-  }
-  return value;
-}
-
-function loadDotEnvIfPresent(path: string): void {
-  if (!existsSync(path)) {
-    return;
+function readOptionalString(value: unknown, fieldName: string): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
   }
 
-  const content = readFileSync(path, "utf8");
-  for (const [index, rawLine] of content.split(/\r?\n/).entries()) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-
-    const normalizedLine = line.startsWith("export ") ? line.slice(7).trim() : line;
-    const separator = normalizedLine.indexOf("=");
-    if (separator <= 0) {
-      throw new Error(`invalid .env line ${index + 1}`);
-    }
-
-    const key = normalizedLine.slice(0, separator).trim();
-    let value = normalizedLine.slice(separator + 1).trim();
-    value = stripWrappedQuotes(value);
-
-    if (process.env[key] === undefined) {
-      process.env[key] = value;
-    }
+  if (typeof value !== "string") {
+    throw new Error(`${fieldName} must be a string`);
   }
+
+  const normalized = value.trim();
+  return normalized ? normalized : undefined;
 }
 
 function ensureConfigDir(): void {
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
 }
 
-function ensureEnvFile(): void {
-  if (!existsSync(ENV_FILE)) {
-    writeFileSync(ENV_FILE, DEFAULT_ENV, { encoding: "utf8", mode: 0o600 });
+function ensureConfigFile(): void {
+  if (!existsSync(CONFIG_FILE)) {
+    writeFileSync(CONFIG_FILE, DEFAULT_CONFIG, { encoding: "utf8", mode: 0o600 });
   }
 
   try {
-    chmodSync(ENV_FILE, 0o600);
+    chmodSync(CONFIG_FILE, 0o600);
   } catch {
   }
 }
@@ -447,17 +552,6 @@ function removePidFileIfOwned(): void {
   if (existsSync(PID_FILE)) {
     unlinkSync(PID_FILE);
   }
-}
-
-function stripWrappedQuotes(value: string): string {
-  if (value.length >= 2) {
-    const quote = value[0];
-    const last = value[value.length - 1];
-    if ((quote === '"' || quote === "'") && last === quote) {
-      return value.slice(1, -1);
-    }
-  }
-  return value;
 }
 
 function joinPath(basePath: string, requestPath: string): string {

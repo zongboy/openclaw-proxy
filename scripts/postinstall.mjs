@@ -3,24 +3,36 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const configDir = join(homedir(), ".openclaw-proxy");
-const envFile = join(configDir, ".env");
-const defaultEnv = `TARGET_BASE_URL="https://your-openclaw.example.com"
-API_KEY="your-openclaw-key"
-API_KEY_VALUE=""
-API_KEY_HEADER="Authorization"
-API_KEY_PREFIX="Bearer"
-LISTEN_ADDR=":8080"
+const configFile = join(configDir, "config.json");
+const defaultConfig = `${JSON.stringify(
+  {
+    listenAddr: "127.0.0.1:8080",
+    providers: [
+      {
+        name: "aliyuncs",
+        virtualApiKey: "proxy-aliyuncs-demo",
+        targetBaseUrl: "https://your-openclaw.example.com/v1",
+        apiKey: "your-real-api-key",
+        apiKeyValue: "",
+        apiKeyHeader: "Authorization",
+        apiKeyPrefix: "Bearer"
+      }
+    ]
+  },
+  null,
+  2
+)}
 `;
 
 mkdirSync(configDir, { recursive: true, mode: 0o700 });
 
-if (!existsSync(envFile)) {
-  writeFileSync(envFile, defaultEnv, { encoding: "utf8", mode: 0o600 });
+if (!existsSync(configFile)) {
+  writeFileSync(configFile, defaultConfig, { encoding: "utf8", mode: 0o600 });
 }
 
 try {
-  chmodSync(envFile, 0o600);
+  chmodSync(configFile, 0o600);
 } catch {
 }
 
-console.log(`openclaw-proxy config ready: ${envFile}`);
+console.log(`openclaw-proxy config ready: ${configFile}`);
